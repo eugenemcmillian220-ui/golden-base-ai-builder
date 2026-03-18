@@ -114,8 +114,8 @@ export async function POST(request: NextRequest) {
     }
 
     // Get system and user prompts
-    const systemPrompt = getSystemPrompt(framework, designSystem, template);
-    const enhancedPrompt = createEnhancedPrompt(prompt, framework, template);
+    const systemPrompt = getSystemPrompt(framework);
+    const enhancedPrompt = createEnhancedPrompt(prompt, framework, designSystem);
 
     // Call OpenAI API
     const { apiKey } = await getOpenAIClient();
