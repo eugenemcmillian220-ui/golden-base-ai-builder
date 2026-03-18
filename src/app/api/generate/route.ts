@@ -1,10 +1,29 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@/lib/supabase/server';
+import { rateLimit } from '@/lib/rate-limit';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
 export async function POST(request: NextRequest) {
   try {
+    // Basic rate limiting by IP (or user ID if available)
+    const ip = request.headers.get('x-forwarded-for') || '127.0.0.1';
+    const { success, limit, remaining, resetAt } = await rateLimit(ip, 10, 60000);
+
+    if (!success) {
+      return NextResponse.json(
+        { error: 'Rate limit exceeded. Try again in a minute.' },
+        { 
+          status: 429,
+          headers: {
+            'X-RateLimit-Limit': limit.toString(),
+            'X-RateLimit-Remaining': remaining.toString(),
+            'X-RateLimit-Reset': resetAt.toString(),
+          }
+        }
+      );
+    }
+
     if (!OPENAI_API_KEY) {
       return NextResponse.json(
         { error: 'OpenAI API key not configured' },
