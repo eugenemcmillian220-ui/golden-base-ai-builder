@@ -6,6 +6,8 @@ import { ClientCursorTracker } from '@/lib/collab/cursor-tracking';
 import { ActivityLogClient } from '@/lib/collab/activity-log';
 import type { CursorPosition, UserPresence } from '@/lib/collab/cursor-tracking';
 import type { ActivityEvent } from '@/lib/collab/activity-log';
+import { supabase } from '@/lib/supabase';
+import { RealtimeChannel } from '@supabase/supabase-js';
 
 interface UseCollaborationProps {
   projectId: string;
@@ -27,8 +29,8 @@ interface CollaborationState {
 }
 
 /**
- * Hook for managing real-time collaborative editing
- * Handles WebSocket connection, OT sync, cursor tracking, and activity logging
+ * Hook for managing real-time collaborative editing using Supabase Realtime
+ * Handles presence tracking, cursor positions, and OT sync
  */
 export function useCollaboration({
   projectId,
@@ -39,7 +41,6 @@ export function useCollaboration({
   onCodeChange,
   onActivityUpdate,
 }: UseCollaborationProps) {
-  // Use provided session data instead of next-auth
   const [state, setState] = useState<CollaborationState>({
     isConnected: false,
     remoteCursors: [],
@@ -51,10 +52,8 @@ export function useCollaboration({
   const otClientRef = useRef<OTClient | null>(null);
   const cursorTrackerRef = useRef<ClientCursorTracker | null>(null);
   const activityLogRef = useRef<ActivityLogClient | null>(null);
-  const socketRef = useRef<WebSocket | null>(null);
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const syncQueueRef = useRef<Array<{ type: string; data: any }>>([]);
-  const isSyncingRef = useRef(false);
+  const channelRef = useRef<RealtimeChannel | null>(null);
+  const userColorRef = useRef<string>(`#${Math.floor(Math.random() * 16777215).toString(16).padStart(6, '0')}`);
 
   // Initialize collaboration clients
   useEffect(() => {
@@ -72,7 +71,7 @@ export function useCollaboration({
 
       cursorTrackerRef.current.initialize(userEmail, userName);
 
-      // Listen to activity events
+      // Listen to activity events from the client-side engine
       if (activityLogRef.current) {
         activityLogRef.current.onActivity((event) => {
           setState((prev) => ({
@@ -90,187 +89,126 @@ export function useCollaboration({
         syncStatus: 'error',
       }));
     }
-  }, [userId, projectId, enabled, onActivityUpdate]);
+  }, [userId, projectId, enabled, userEmail, userName, onActivityUpdate]);
 
-  // Connect WebSocket
-  const connectWebSocket = useCallback(() => {
-    if (!enabled || !userId) return;
-
-    try {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/api/v2/collab/ws?projectId=${projectId}&userId=${userId}`;
-
-      socketRef.current = new WebSocket(wsUrl);
-
-      socketRef.current.onopen = () => {
-        console.log('[Collab] WebSocket connected');
-        setState((prev) => ({
-          ...prev,
-          isConnected: true,
-          syncStatus: 'synced',
-          error: undefined,
-        }));
-
-        // Process sync queue
-        if (syncQueueRef.current.length > 0) {
-          const queue = syncQueueRef.current;
-          syncQueueRef.current = [];
-          queue.forEach((item) => {
-            socketRef.current?.send(JSON.stringify(item));
-          });
-        }
-      };
-
-      socketRef.current.onmessage = (event) => {
-        try {
-          const message = JSON.parse(event.data);
-
-          switch (message.type) {
-            case 'cursor-update':
-              setState((prev) => ({
-                ...prev,
-                remoteCursors: [
-                  ...prev.remoteCursors.filter(
-                    (c) => c.userId !== message.data.userId
-                  ),
-                  message.data,
-                ],
-              }));
-              break;
-
-            case 'user-joined':
-              setState((prev) => ({
-                ...prev,
-                activeUsers: [...prev.activeUsers, message.data],
-              }));
-              break;
-
-            case 'user-left':
-              setState((prev) => ({
-                ...prev,
-                activeUsers: prev.activeUsers.filter(
-                  (u) => u.userId !== message.data.userId
-                ),
-                remoteCursors: prev.remoteCursors.filter(
-                  (c) => c.userId !== message.data.userId
-                ),
-              }));
-              break;
-
-            case 'operation':
-              if (
-                otClientRef.current &&
-                message.data.userId !== userId
-              ) {
-                const transformedOp = otClientRef.current.applyRemoteOperation(
-                  message.data
-                );
-                onCodeChange?.(message.data.content);
-              }
-              break;
-
-            case 'activity':
-              setState((prev) => ({
-                ...prev,
-                recentActivity: [
-                  message.data,
-                  ...prev.recentActivity,
-                ].slice(0, 50),
-              }));
-              onActivityUpdate?.(message.data);
-              break;
-
-            case 'sync-ack':
-              isSyncingRef.current = false;
-              setState((prev) => ({
-                ...prev,
-                syncStatus: 'synced',
-              }));
-              break;
-
-            default:
-              break;
-          }
-        } catch (error) {
-          console.error('[Collab] Failed to process WebSocket message:', error);
-        }
-      };
-
-      socketRef.current.onerror = (error) => {
-        console.error('[Collab] WebSocket error:', error);
-        setState((prev) => ({
-          ...prev,
-          isConnected: false,
-          syncStatus: 'error',
-          error: 'WebSocket connection error',
-        }));
-      };
-
-      socketRef.current.onclose = () => {
-        console.log('[Collab] WebSocket disconnected');
-        setState((prev) => ({
-          ...prev,
-          isConnected: false,
-        }));
-
-        // Attempt reconnect
-        if (enabled) {
-          reconnectTimeoutRef.current = setTimeout(() => {
-            connectWebSocket();
-          }, 3000);
-        }
-      };
-    } catch (error) {
-      console.error('[Collab] Failed to connect WebSocket:', error);
-      setState((prev) => ({
-        ...prev,
-        error: 'Failed to connect WebSocket',
-        syncStatus: 'error',
-      }));
-    }
-  }, [enabled, userId, projectId, onCodeChange, onActivityUpdate]);
-
-  // Initial connection
+  // Connect to Supabase Realtime Channel
   useEffect(() => {
-    if (enabled && userId) {
-      connectWebSocket();
-    }
+    if (!enabled || !userId || !projectId) return;
+
+    console.log(`[Collab] Connecting to channel project:${projectId}`);
+
+    const channel = supabase.channel(`project:${projectId}`, {
+      config: {
+        presence: {
+          key: userId,
+        },
+      },
+    });
+
+    channelRef.current = channel;
+
+    channel
+      .on('presence', { event: 'sync' }, () => {
+        const presenceState = channel.presenceState();
+        const users: UserPresence[] = [];
+        
+        Object.keys(presenceState).forEach((key) => {
+          const userPresences = presenceState[key] as any[];
+          userPresences.forEach((p) => {
+            users.push({
+              userId: p.userId,
+              userEmail: p.userEmail,
+              userName: p.userName,
+              color: p.color,
+              lastSeen: Date.now(),
+              isOnline: true,
+            });
+          });
+        });
+
+        setState((prev) => ({
+          ...prev,
+          activeUsers: users,
+        }));
+      })
+      .on('broadcast', { event: 'cursor-move' }, ({ payload }) => {
+        setState((prev) => ({
+          ...prev,
+          remoteCursors: [
+            ...prev.remoteCursors.filter((c) => c.userId !== payload.userId),
+            payload,
+          ],
+        }));
+      })
+      .on('broadcast', { event: 'operation' }, ({ payload }) => {
+        if (otClientRef.current && payload.userId !== userId) {
+          const transformedOp = otClientRef.current.applyRemoteOperation(payload);
+          // If content is provided in the operation, use it to update the code
+          // In a production app, you'd apply the operation to the editor's text model
+          if (payload.content !== undefined || payload.length !== undefined) {
+            onCodeChange?.(payload.content || '');
+          }
+        }
+      })
+      .on('broadcast', { event: 'activity' }, ({ payload }) => {
+        setState((prev) => ({
+          ...prev,
+          recentActivity: [payload, ...prev.recentActivity].slice(0, 50),
+        }));
+        onActivityUpdate?.(payload);
+      })
+      .subscribe(async (status) => {
+        if (status === 'SUBSCRIBED') {
+          console.log('[Collab] Subscribed to Supabase Realtime');
+          setState((prev) => ({
+            ...prev,
+            isConnected: true,
+            syncStatus: 'synced',
+          }));
+
+          await channel.track({
+            userId,
+            userEmail,
+            userName,
+            color: userColorRef.current,
+            online_at: new Date().toISOString(),
+          });
+        } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR') {
+          console.error(`[Collab] Channel error: ${status}`);
+          setState((prev) => ({
+            ...prev,
+            isConnected: false,
+            syncStatus: 'error',
+            error: `Connection ${status.toLowerCase()}`,
+          }));
+        }
+      });
 
     return () => {
-      if (socketRef.current) {
-        socketRef.current.close();
-      }
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-      }
+      console.log(`[Collab] Leaving channel project:${projectId}`);
+      channel.unsubscribe();
+      channelRef.current = null;
     };
-  }, [enabled, userId, connectWebSocket]);
+  }, [enabled, userId, projectId, userEmail, userName, onCodeChange, onActivityUpdate]);
 
-  // Send cursor position
+  // Send cursor position updates
   const updateCursorPosition = useCallback(
     (line: number, column: number) => {
-      if (!cursorTrackerRef.current || !socketRef.current) return;
+      if (!cursorTrackerRef.current || !channelRef.current) return;
 
       const cursor = cursorTrackerRef.current.updateCursor(line, column);
+      cursor.color = userColorRef.current;
 
-      if (socketRef.current.readyState === WebSocket.OPEN) {
-        socketRef.current.send(
-          JSON.stringify({
-            type: 'cursor-move',
-            data: cursor,
-          })
-        );
-      } else {
-        syncQueueRef.current.push({
-          type: 'cursor-move',
-          data: cursor,
-        });
-      }
+      channelRef.current.send({
+        type: 'broadcast',
+        event: 'cursor-move',
+        payload: cursor,
+      });
     },
     []
   );
 
-  // Send code edit
+  // Send code edits via OT
   const sendCodeEdit = useCallback(
     (
       type: 'insert' | 'delete',
@@ -278,7 +216,7 @@ export function useCollaboration({
       content?: string,
       length?: number
     ) => {
-      if (!otClientRef.current || !socketRef.current) return;
+      if (!otClientRef.current || !channelRef.current) return;
 
       setState((prev) => ({
         ...prev,
@@ -286,29 +224,25 @@ export function useCollaboration({
       }));
 
       const operation = otClientRef.current.createOperation(
-        userId || 'anonymous',
+        userId,
         type,
         position,
         content,
         length
       );
 
-      if (socketRef.current.readyState === WebSocket.OPEN) {
-        isSyncingRef.current = true;
-        socketRef.current.send(
-          JSON.stringify({
-            type: 'operation',
-            data: operation,
-          })
-        );
-      } else {
-        syncQueueRef.current.push({
-          type: 'operation',
-          data: operation,
-        });
-      }
+      channelRef.current.send({
+        type: 'broadcast',
+        event: 'operation',
+        payload: operation,
+      });
 
-      // Log activity
+      setState((prev) => ({
+        ...prev,
+        syncStatus: 'synced',
+      }));
+
+      // Log activity in the local activity log
       if (activityLogRef.current) {
         activityLogRef.current.logCodeChange('editor', 1);
       }
@@ -316,10 +250,10 @@ export function useCollaboration({
     [userId]
   );
 
-  // Add comment
+  // Add a new comment
   const addComment = useCallback(
     (content: string, lineNumber?: number) => {
-      if (!activityLogRef.current || !socketRef.current) return;
+      if (!activityLogRef.current || !channelRef.current) return;
 
       const comment = activityLogRef.current.addComment(
         content,
@@ -327,44 +261,78 @@ export function useCollaboration({
         lineNumber
       );
 
-      if (socketRef.current.readyState === WebSocket.OPEN) {
-        socketRef.current.send(
-          JSON.stringify({
-            type: 'comment',
-            data: comment,
-          })
-        );
-      } else {
-        syncQueueRef.current.push({
-          type: 'comment',
-          data: comment,
-        });
-      }
+      // Broadcast the comment to other users
+      channelRef.current.send({
+        type: 'broadcast',
+        event: 'activity',
+        payload: {
+          id: comment.id,
+          projectId,
+          userId,
+          userEmail,
+          userName,
+          action: 'comment',
+          entityType: 'comment',
+          description: `${userName} added a comment`,
+          metadata: { content, lineNumber },
+          timestamp: Date.now(),
+        },
+      });
+
+      // Also persist to Supabase
+      supabase.from('comments').insert({
+        project_id: projectId,
+        user_id: userId,
+        content,
+        line_number: lineNumber,
+      }).then(({ error }) => {
+        if (error) console.error('Error persisting comment:', error);
+      });
 
       return comment;
     },
-    []
+    [projectId, userId, userEmail, userName]
   );
 
-  // Reply to comment
+  // Reply to an existing comment
   const replyToComment = useCallback(
     (commentId: string, content: string) => {
-      if (!activityLogRef.current || !socketRef.current) return;
+      if (!activityLogRef.current || !channelRef.current) return;
 
       const reply = activityLogRef.current.reply(commentId, content);
 
-      if (reply && socketRef.current.readyState === WebSocket.OPEN) {
-        socketRef.current.send(
-          JSON.stringify({
-            type: 'comment-reply',
-            data: reply,
-          })
-        );
+      if (reply) {
+        channelRef.current.send({
+          type: 'broadcast',
+          event: 'activity',
+          payload: {
+            id: `reply-${Date.now()}`,
+            projectId,
+            userId,
+            userEmail,
+            userName,
+            action: 'comment',
+            entityType: 'comment',
+            description: `${userName} replied to a comment`,
+            metadata: { commentId, content },
+            timestamp: Date.now(),
+          },
+        });
+
+        // Persist reply to Supabase
+        supabase.from('comments').insert({
+          project_id: projectId,
+          user_id: userId,
+          content,
+          parent_id: commentId,
+        }).then(({ error }) => {
+          if (error) console.error('Error persisting reply:', error);
+        });
       }
 
       return reply;
     },
-    []
+    [projectId, userId, userEmail, userName]
   );
 
   return {
@@ -373,6 +341,10 @@ export function useCollaboration({
     sendCodeEdit,
     addComment,
     replyToComment,
-    reconnect: connectWebSocket,
+    reconnect: () => {
+      if (channelRef.current) {
+        channelRef.current.subscribe();
+      }
+    },
   };
 }
